@@ -16,6 +16,7 @@ active = None
 expression = None
 files = set()
 functions = set()
+tail_functions = set()
 records = {}
 expected = {}
 optimization = None
@@ -34,6 +35,7 @@ def visit(code, offset):
             functions.add((name, code.co_firstlineno))
         else:
             files.add(name)
+            tail_functions.add((name, code.co_firstlineno))
     return monitoring.DISABLE
 
 
@@ -69,6 +71,7 @@ def pytest_sessionstart(session):
             expression = result
             optimization = digest, pickle.dumps(result, protocol=5), tuple(sorted(functions))
             files.clear()
+            tail_functions.clear()
             monitoring.restart_events()
             monitoring.set_events(4, monitoring.events.PY_START)
         return result
@@ -81,7 +84,7 @@ def pytest_sessionstart(session):
         if key:
             monitoring.set_events(4, 0)
             records[key] = (digest, pickle.dumps(result, protocol=5),
-                               tuple(sorted(files)), *optimization)
+                            tuple(sorted(files)), *optimization, tuple(sorted(tail_functions)))
             active = None
         return result
 

@@ -77,6 +77,75 @@ def compare_mask(module, edits, profile):
     return affected
 
 
+def lookup_mask(module, edits, profile):
+    masks = profile["masks"]
+    affected = 0
+    for chain in edits:
+        pair = next(((a, b) for a, b in reversed(chain) if isinstance(a, ast.Call) and isinstance(b, ast.Call)), None)
+        if pair is None:
+            return None
+        old, new = pair
+        if not isinstance(old.func, ast.Attribute) or old.func.attr != "get" or new.keywords:
+            return None
+        if not old.args or len(old.args) != len(new.args) or ast.dump(old.func) != ast.dump(new.func):
+            return None
+        if any(ast.dump(a) != ast.dump(b) for a, b in zip(old.args[1:], new.args[1:])):
+            return None
+        before, after = old.args[0], new.args[0]
+        if not (isinstance(before, ast.Constant) and isinstance(after, ast.Constant)
+                and type(before.value) is str and type(after.value) is str and before.value != after.value):
+            return None
+        site = f"{module}:{old.lineno}:{old.col_offset}"
+        if site not in profile["sites"]:
+            return None
+        unknown, rows = profile["sites"][site]
+        affected |= masks[unknown]
+        for matches, different, default_differs, index in rows:
+            if after.value in different or (default_differs and after.value not in matches):
+                affected |= masks[index]
+    return affected if edits else None
+
+
+def enum_mask(module, edits, profile):
+    masks = profile["masks"]
+    affected = 0
+    for chain in edits:
+        pair = next(((a, b) for a, b in reversed(chain) if isinstance(a, ast.Compare)
+                     and isinstance(b, ast.Compare)), None)
+        if pair is None:
+            return None
+        old, new = pair
+        if len(old.ops) != 1 or len(new.ops) != 1 or ast.dump(old.left) != ast.dump(new.left):
+            return None
+        if type(old.ops[0]) not in (ast.Is, ast.IsNot, ast.Eq, ast.NotEq) or type(new.ops[0]) not in (
+            ast.Is, ast.IsNot, ast.Eq, ast.NotEq
+        ):
+            return None
+        before, after = old.comparators[0], new.comparators[0]
+        if not isinstance(before, ast.Attribute) or not isinstance(after, ast.Attribute):
+            return None
+        if not before.attr.isupper() or not after.attr.isupper() or ast.dump(before.value) != ast.dump(after.value):
+            return None
+        path = f"{module}:{old.lineno}:{old.col_offset}"
+        record = profile["sites"].get(path)
+        if record is None:
+            return None
+        other, rows = record
+        affected |= masks[other]
+        for (left_type, left), (right_type, right), result, index in rows:
+            members = profile["enums"][right_type]
+            if members.get(before.attr) != right or after.attr not in members:
+                return None
+            if left_type != right_type and isinstance(new.ops[0], (ast.Eq, ast.NotEq)):
+                affected |= masks[index]
+                continue
+            equal = left_type == right_type and left == members[after.attr]
+            actual = not equal if isinstance(new.ops[0], (ast.IsNot, ast.NotEq)) else equal
+            if actual != result:
+                affected |= masks[index]
+    return affected if edits else None
+
+
 def bool_mask(module, edits, profile):
     matches = {}
     for chain in edits:

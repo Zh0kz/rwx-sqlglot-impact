@@ -51,10 +51,12 @@ class ExecutorCache:
                 self.expected = row
                 continue
             digest, value, files, *details = row
-            if changed.isdisjoint(files):
+            tail = details[3] if len(details) == 4 else None
+            independent_tail = tail is not None and edited_functions and edited_functions.isdisjoint(tail)
+            if changed.isdisjoint(files) or independent_tail:
                 self.entries[key] = digest, value
             if details and edited_functions is not None:
-                input_digest, expression, called = details
+                input_digest, expression, called = details[:3]
                 if edited_functions.isdisjoint(called):
                     self.optimized[key] = input_digest, expression
         self.key = None

@@ -70,8 +70,9 @@ def refine(delta, coverage, chosen, catalog, durations, case_index, rewrite, dea
     scope_mask = case_index.affected(delta, coverage, rewrite)
     use_cache = (Path("/app/executor.z").is_file() and bool(sources) and not fixtures
                  and all(module in coverage.warm_functions
-                         and (module.startswith(("sqlglot.optimizer.", "sqlglot.parsers."))
-                              or module == "sqlglot.parser") for module in sources))
+                         and (module.startswith(("sqlglot.optimizer.", "sqlglot.parsers.",
+                                                  "sqlglot.generators.", "sqlglot.expressions."))
+                              or module in {"sqlglot.parser", "sqlglot.generator"}) for module in sources))
     edited_functions = set()
     if use_cache:
         for path in delta:

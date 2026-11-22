@@ -20,4 +20,6 @@ The selector reads benchmark SQL fixture pairs using the original readers' conve
 
 The build packs global name references from the pinned source. The `registry_profile` plugin records baseline generator type-map lookups (REGISTRY_OUT). The optional `executor_profile` plugin records unmodified optimizer and execution intermediates from the two original TPC execution tests (EXECUTOR_OUT). Run the profile module directly with TABLES_OUT to cache fixture tables produced by the original setup. Runtime replay can reuse an intermediate only when the live inputs match and the edited functions fall outside the recorded dependency set.
 
+The `lookup_profile` and `enum_profile` plugins record ordinary dictionary and enum operands from the reference suite (LOOKUP_OUT and ENUM_OUT). Run `import_profile.py` from the pinned checkout to capture which modules each test imports (IMPORT_OUT).
+
 To regenerate the coverage artifact, use CPython 3.13 and install the competition test dependencies. From the pinned checkout, put the checkout and this repository on PYTHONPATH, set TEST_LIST to the official tests.json, MAP_OUT to an absolute destination for map.z and SKIP_INTEGRATION to 0. Run `python -m pytest -q -p build_map tests`. The tracer uses the baseline test suite only. Dataset-specific patch answers are not inputs.

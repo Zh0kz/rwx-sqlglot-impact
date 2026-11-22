@@ -106,6 +106,9 @@ class Coverage:
         self.tokenizer = load_profile("tokens")
         self.order = load_profile("order")
         self.registries = load_profile("registry")
+        self.lookups = load_profile("lookups")
+        self.enums = load_profile("enums")
+        self.imports = load_profile("imports")
         self.type_profiles = json.loads((HERE / "types.json").read_bytes())
         dictionary_file = HERE / "dicts.z"
         self.dict_keys = (json.loads(zlib.decompress(dictionary_file.read_bytes()))
@@ -133,6 +136,18 @@ class Coverage:
             return bindings.References.unpack(packed.read_bytes())
         return bindings.References(self.sources)
 
+    def import_failure(self, path):
+        if not self.imports:
+            return self.full
+        seen = self.imports["files"].get(path)
+        observed = self.lines.get(path)
+        if not seen and not observed:
+            return self.full
+        mask = int(self.imports["unknown"], 16) | int(seen or "0", 16)
+        for tests in (observed or {}).values():
+            mask |= tests
+        return mask | self.dialects.get(Path(path).stem, 0)
+
     def select(self, path, hunks, single=True):
         if not path.endswith(".py"):
             if single:
@@ -144,11 +159,14 @@ class Coverage:
             return self.full
         try:
             new_source, affected = rewrite(self.sources[path], hunks)
+        except ValueError:
+            return self.full
+        try:
             old = self.syntax(path)
             new = ast.parse(new_source)
             compile(new, path, "exec")
-        except (ValueError, SyntaxError):
-            return self.full
+        except SyntaxError:
+            return self.import_failure(path)
         module = path[:-3].removesuffix("/__init__").replace("/", ".")
         edits_ast = behavior.changes(old, new)
         if not edits_ast:
@@ -166,6 +184,14 @@ class Coverage:
             self.warm_functions[module] = sorted(covered)
         if self.values:
             reduced = behavior.compare_mask(module, edits_ast, self.values)
+            if reduced is not None:
+                return reduced
+        if self.lookups:
+            reduced = behavior.lookup_mask(module, edits_ast, self.lookups)
+            if reduced is not None:
+                return reduced
+        if self.enums:
+            reduced = behavior.enum_mask(module, edits_ast, self.enums)
             if reduced is not None:
                 return reduced
         if self.order:
