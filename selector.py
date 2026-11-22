@@ -4,14 +4,25 @@ import functools
 import json
 import os
 import re
-import subprocess
+import time
 import sys
 import zlib
 from pathlib import Path
 from equivalence import same_comparison_behavior
+import behavior
 
 HERE = Path(__file__).resolve().parent
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+
+
+def load_profile(name):
+    location = HERE / (name + ".z")
+    if not location.exists():
+        return None
+    profile = json.loads(zlib.decompress(location.read_bytes()))
+    if "masks" in profile:
+        profile["masks"] = [int(s, 16) for s in profile["masks"]]
+    return profile
 
 
 def changes(diff):
@@ -83,6 +94,13 @@ class Coverage:
         self.ids = data["tests"]
         self.full = (1 << len(self.ids)) - 1
         self.sources = json.loads(zlib.decompress((HERE / "source.z").read_bytes()))
+        self.scope_keys = {}
+        self.identical = set()
+        self.warm_functions = {}
+        self.case_index = None
+        self.values = load_profile("values")
+        self.booleans = load_profile("bools")
+        self.arguments = load_profile("args")
         self.type_profiles = json.loads((HERE / "types.json").read_bytes())
         dictionary_file = HERE / "dicts.z"
         self.dict_keys = (json.loads(zlib.decompress(dictionary_file.read_bytes()))
@@ -104,6 +122,39 @@ class Coverage:
             compile(new, path, "exec")
         except (ValueError, SyntaxError):
             return self.full
+        module = path[:-3].removesuffix("/__init__").replace("/", ".")
+        edits_ast = behavior.changes(old, new)
+        if not edits_ast:
+            self.identical.add(path)
+            return 0
+        covered = set()
+        for chain in edits_ast:
+            ancestors = [a.lineno for i, (a, b) in enumerate(chain[:-1])
+                         if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef))
+                         and isinstance(b, type(a)) and any(chain[i + 1][0] is s for s in a.body)]
+            if not ancestors:
+                break
+            covered.add(tuple(ancestors))
+        else:
+            self.warm_functions[module] = sorted(covered)
+        if self.values:
+            reduced = behavior.compare_mask(module, edits_ast, self.values)
+            if reduced is not None:
+                return reduced
+        if self.booleans:
+            reduced = behavior.bool_mask(module, edits_ast, self.booleans)
+            if reduced is not None:
+                return reduced
+        if self.arguments:
+            reduced = behavior.argument_mask(module, edits_ast, self.arguments)
+            if reduced is not None:
+                return reduced
+        if self.case_index:
+            sites = behavior.dispatch_sites(module, edits_ast)
+            mask = self.case_index.tests_for(sites, self.ids)
+            if mask is not None:
+                self.scope_keys[path] = sites
+                return mask
         edits = (line.lstrip() for _, chunk in hunks for sign, line in chunk if sign != " ")
         if all(not line or line.startswith("#") for line in edits):
             # A leading # inside a multiline string is data. Compare parsed
@@ -152,6 +203,8 @@ class Coverage:
                     parents = ".".join(c.name for c in sorted(enclosing_classes, key=lambda c: c.lineno))
                     key = path[:-3].replace("/", ".") + ":" + parents + "." + target.id
                     if key in self.attributes:
+                        if field.lineno <= min(affected) <= max(affected) <= field.end_lineno:
+                            self.scope_keys[path] = {"attr:" + key}
                         selected |= self.attributes[key]
                         continue
                 if path.startswith("sqlglot/expressions/") and enclosing_classes and self.classes:
@@ -231,36 +284,6 @@ def schedule(numbers, durations):
     return best
 
 
-def replay_small_selection(delta, coverage, chosen, tests, durations):
-    if not chosen or not Path("/src/tests").is_dir():
-        return chosen
-    if sum(durations[n] for n in chosen) > 700:
-        return chosen
-    if any(not tests[n]["file"].startswith("tests/dialects/") for n in chosen):
-        return chosen
-    sources = {}
-    for path, hunks in delta.items():
-        if not path.startswith("sqlglot/") or path not in coverage.sources:
-            return chosen
-        try:
-            source, _ = rewrite(coverage.sources[path], hunks)
-        except ValueError:
-            return chosen
-        module = path[:-3].removesuffix("/__init__").replace("/", ".")
-        sources[module] = source
-    request = {"sources": sources, "tests": [(n, tests[n]["id"]) for n in chosen]}
-    try:
-        run = subprocess.run([sys.executable, "-B", str(HERE / "replay.py")], input=json.dumps(request),
-                             text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4)
-        if run.returncode == 0:
-            failures = json.loads(run.stdout)
-            if isinstance(failures, list) and set(failures) <= set(chosen):
-                return failures
-    except (subprocess.TimeoutExpired, ValueError, TypeError):
-        pass
-    return chosen
-
-
 def main():
     directory = Path(os.environ.get("DATA_DIR", "/data"))
     tests = json.loads((directory / "tests.json").read_bytes())["tests"]
@@ -268,17 +291,31 @@ def main():
     by_name = {t["id"]: t["number"] for t in tests}
     tests_by_number = {t["number"]: t for t in tests}
     coverage = Coverage()
+    case_index = None
+    deadline = time.monotonic() + 85
+    if sys.platform == "linux" and (HERE / "cases.z").is_file() and Path("/src/tests").is_dir():
+        from cases import CaseIndex
+        from probe import refine
+        case_index = CaseIndex(HERE / "cases.z")
+        coverage.case_index = case_index
     mapping = [by_name.get(name) for name in coverage.ids]
     unknown = set(by_name.values()) - set(mapping)
     for patch in sorted((directory / "commits").glob("*.patch")):
+        coverage.scope_keys.clear()
+        coverage.identical.clear()
+        coverage.warm_functions.clear()
         delta = changes(patch.read_text("utf-8"))
         mask = 0 if delta else coverage.full
         for path, hunks in delta.items():
             mask |= coverage.select(path, hunks)
         chosen = [n for i, n in enumerate(mapping) if n is not None and mask & (1 << i)]
         chosen.extend(sorted(unknown))
-        chosen = replay_small_selection(delta, coverage, chosen, tests_by_number, durations)
+        if case_index is not None and os.environ.get("RUNTIME_REPLAY", "1") == "1":
+            chosen = refine(delta, coverage, chosen, tests_by_number, durations, case_index, rewrite, deadline)
         print(json.dumps({"commit": patch.stem, "workers": schedule(chosen, durations)}, separators=(",", ":")))
+    if case_index is not None:
+        import warm
+        warm.close()
 
 
 if __name__ == "__main__":
