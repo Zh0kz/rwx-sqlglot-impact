@@ -14,4 +14,6 @@ The `dict_profile` pytest plugin records which tests read individual keys of cla
 
 Additional baseline plugins record primitive comparison operands (`value_profile`, VALUE_OUT), condition outcomes (`bool_profile`, BOOL_OUT), expression validation inputs (`arg_profile`, ARG_OUT), and individual test-case coverage (`case_profile`, CASE_OUT). These plugins run the unmodified test suite and take the same TEST_LIST setting. The selector falls back to coverage when it cannot model an edit.
 
+The `instruction_profile` plugin records execution by Python source span (INSTRUCTION_OUT). The `token_profile` plugin maps each lookup in the effective tokenizer configuration back to the tester and its dictionary (TOKEN_OUT).
+
 To regenerate the coverage artifact, use CPython 3.13 and install the competition test dependencies. From the pinned checkout, put the checkout and this repository on PYTHONPATH, set TEST_LIST to the official tests.json, MAP_OUT to an absolute destination for map.z and SKIP_INTEGRATION to 0. Run `python -m pytest -q -p build_map tests`. The tracer uses the baseline test suite only. Dataset-specific patch answers are not inputs.

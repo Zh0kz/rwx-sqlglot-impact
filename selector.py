@@ -101,6 +101,7 @@ class Coverage:
         self.values = load_profile("values")
         self.booleans = load_profile("bools")
         self.arguments = load_profile("args")
+        self.tokenizer = load_profile("tokens")
         self.type_profiles = json.loads((HERE / "types.json").read_bytes())
         dictionary_file = HERE / "dicts.z"
         self.dict_keys = (json.loads(zlib.decompress(dictionary_file.read_bytes()))
@@ -109,6 +110,17 @@ class Coverage:
     @functools.cache
     def syntax(self, path):
         return ast.parse(self.sources[path])
+
+    @functools.cached_property
+    def token_names(self):
+        tree = self.syntax("sqlglot/tokenizer_core.py")
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "TokenType")
+        return {name.id for stmt in cls.body if isinstance(stmt, ast.Assign)
+                for name in stmt.targets if isinstance(name, ast.Name)}
+
+    @functools.cached_property
+    def instructions(self):
+        return load_profile("instructions")
 
     def select(self, path, hunks):
         if not path.endswith(".py"):
@@ -149,6 +161,10 @@ class Coverage:
             reduced = behavior.argument_mask(module, edits_ast, self.arguments)
             if reduced is not None:
                 return reduced
+        if self.tokenizer:
+            reduced = behavior.tokenizer_mask(module, edits_ast, self.tokenizer, self.token_names)
+            if reduced is not None:
+                return reduced
         if self.case_index:
             sites = behavior.dispatch_sites(module, edits_ast)
             mask = self.case_index.tests_for(sites, self.ids)
@@ -168,6 +184,10 @@ class Coverage:
         if dictionary is not None:
             return dictionary
         rows = self.lines.get(path, {})
+        if self.instructions:
+            reduced = behavior.instruction_mask(path, edits_ast, self.instructions, rows)
+            if reduced is not None:
+                return reduced
         selected = 0
         for number in affected:
             selected |= rows.get(number, 0)

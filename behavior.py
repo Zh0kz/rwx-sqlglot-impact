@@ -153,6 +153,93 @@ def argument_mask(module, edits, profile):
     return affected if edits else None
 
 
+def instruction_mask(path, edits, profiles, line_masks):
+    file = profiles["files"].get(path)
+    if not file:
+        return None
+    spans = {}
+    for line, start, end, index in file:
+        spans.setdefault(line, []).append((start, end, profiles["masks"][index]))
+    affected = 0
+    for chain in edits:
+        if not any(isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) and
+                   any(chain[i + 1][0] is stmt for stmt in parent.body)
+                   for i, (parent, _) in enumerate(chain[:-1])):
+            return None
+        node = next((a for a, _ in reversed(chain) if isinstance(a, ast.expr)), None)
+        if node is None or node.lineno != node.end_lineno:
+            return None
+        if not isinstance(node, (ast.Constant, ast.Name, ast.Attribute, ast.UnaryOp,
+                                 ast.Compare, ast.BinOp, ast.Call, ast.Subscript)):
+            return None
+        candidates = [(start, end, mask) for start, end, mask in spans.get(node.lineno, ())
+                      if node.col_offset <= start < end <= node.end_col_offset]
+        exact = [mask for start, end, mask in candidates
+                 if start == node.col_offset and end == node.end_col_offset]
+        if not exact:
+            return None
+        witnessed = 0
+        for start, end, mask in spans.get(node.lineno, ()):
+            if start < end:
+                witnessed |= mask
+        # Keep coverage recorded by the isolated test runs but not witnessed
+        # on this source line during the instruction-profile pass.
+        affected |= line_masks.get(node.lineno, 0) & ~witnessed
+        for _, _, mask in candidates:
+            affected |= mask
+    return affected if edits else None
+
+
+def tokenizer_mask(module, edits, profile, token_names):
+    affected = 0
+    inspected = set()
+    for chain in edits:
+        location = next((i for i, (a, b) in enumerate(chain[:-1])
+                         if isinstance(a, ast.Dict) and isinstance(b, ast.Dict)
+                         and any(chain[i + 1][0] is v for v in a.values)), None)
+        if location is None:
+            return None
+        old, new = chain[location]
+        if old in inspected:
+            continue
+        inspected.add(old)
+        parent, _ = chain[location - 1]
+        if isinstance(parent, ast.Assign):
+            targets = parent.targets
+        elif isinstance(parent, ast.AnnAssign):
+            targets = [parent.target]
+        else:
+            return None
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name) or parent.value is not old:
+            return None
+        if any(isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)) for a, _ in chain[:location]):
+            return None
+        qualified = ".".join([*(a.name for a, _ in chain[:location] if isinstance(a, ast.ClassDef)),
+                              targets[0].id])
+        rows = profile.get(f"{module}:{qualified}")
+        if rows is None or len(old.keys) != len(new.keys):
+            return None
+        for k, k2, v, v2 in zip(old.keys, new.keys, old.values, new.values):
+            if (k is None) != (k2 is None) or k is not None and ast.dump(k) != ast.dump(k2):
+                return None
+            if ast.dump(v) == ast.dump(v2):
+                continue
+            if not isinstance(k, ast.Constant) or type(k.value) is not str:
+                return None
+            try:
+                if isinstance(v, ast.Attribute) and isinstance(v2, ast.Attribute):
+                    if not (isinstance(v.value, ast.Name) and isinstance(v2.value, ast.Name)
+                            and v.value.id == v2.value.id == "TokenType" and v2.attr in token_names):
+                        return None
+                else:
+                    if type(literal(v)) is not type(literal(v2)):
+                        return None
+            except (ValueError, TypeError, SyntaxError):
+                return None
+            affected |= int(rows.get(k.value, "0"), 16)
+    return affected if edits else None
+
+
 def dispatch_sites(module, edits):
     locations = set()
     for chain in edits:
