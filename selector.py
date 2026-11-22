@@ -4,6 +4,7 @@ import functools
 import json
 import os
 import re
+import subprocess
 import sys
 import zlib
 from pathlib import Path
@@ -83,6 +84,9 @@ class Coverage:
         self.full = (1 << len(self.ids)) - 1
         self.sources = json.loads(zlib.decompress((HERE / "source.z").read_bytes()))
         self.type_profiles = json.loads((HERE / "types.json").read_bytes())
+        dictionary_file = HERE / "dicts.z"
+        self.dict_keys = (json.loads(zlib.decompress(dictionary_file.read_bytes()))
+                          if dictionary_file.exists() else {})
 
     @functools.cache
     def syntax(self, path):
@@ -109,6 +113,9 @@ class Coverage:
         elif any(" is " in line for _, chunk in hunks for sign, line in chunk if sign != " "):
             if same_comparison_behavior(old, new, path[:-3].replace("/", "."), self.type_profiles):
                 return 0
+        dictionary = self.dictionary_update(path, old, new, affected)
+        if dictionary is not None:
+            return dictionary
         rows = self.lines.get(path, {})
         selected = 0
         for number in affected:
@@ -154,6 +161,55 @@ class Coverage:
                     selected |= self.dialects.get(dialect, self.full)
         return selected
 
+    def dictionary_update(self, path, old, new, affected):
+        if not self.dict_keys:
+            return None
+        module = path[:-3].replace("/", ".")
+        # Only a replacement of values under existing literal keys can be
+        # handled by key-read coverage. Confirm the rest of the syntax tree.
+        before_classes = [n for n in ast.walk(old) if isinstance(n, ast.ClassDef)
+                          and affected and n.lineno <= min(affected) <= max(affected) <= n.end_lineno]
+        if not before_classes:
+            return None
+        scope = min(before_classes, key=lambda c: c.end_lineno - c.lineno)
+        qualified = ".".join(c.name for c in sorted(before_classes, key=lambda c: c.lineno))
+        for stmt in scope.body:
+            if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or not isinstance(stmt.value, ast.Dict):
+                continue
+            if not stmt.lineno <= min(affected) <= max(affected) <= stmt.end_lineno:
+                continue
+            name = stmt.targets[0] if isinstance(stmt, ast.Assign) else stmt.target
+            if not isinstance(name, ast.Name):
+                continue
+            records = self.dict_keys.get(f"{module}:{qualified}.{name.id}")
+            if not records:
+                continue
+            other = next((n for n in ast.walk(new) if type(n) is type(stmt)
+                          and n.lineno == stmt.lineno and isinstance(n.value, ast.Dict)), None)
+            if other is None or len(stmt.value.keys) != len(other.value.keys):
+                continue
+            changed_keys = []
+            for k, k2, v, v2 in zip(stmt.value.keys, other.value.keys, stmt.value.values, other.value.values):
+                if not isinstance(k, ast.Constant) or not isinstance(k.value, str) or not isinstance(k2, ast.Constant) or k.value != k2.value:
+                    return None
+                if ast.dump(v) != ast.dump(v2):
+                    try:
+                        ast.literal_eval(v)
+                        ast.literal_eval(v2)
+                    except (ValueError, TypeError):
+                        return None
+                    changed_keys.append(k.value)
+            saved = other.value
+            other.value = stmt.value
+            equal_elsewhere = ast.dump(old) == ast.dump(new)
+            other.value = saved
+            if equal_elsewhere and changed_keys:
+                mask = int(records.get("*", "0"), 16)
+                for k in changed_keys:
+                    mask |= int(records.get(k, "0"), 16)
+                return mask
+        return None
+
 
 def schedule(numbers, durations):
     if not numbers:
@@ -175,11 +231,42 @@ def schedule(numbers, durations):
     return best
 
 
+def replay_small_selection(delta, coverage, chosen, tests, durations):
+    if not chosen or not Path("/src/tests").is_dir():
+        return chosen
+    if sum(durations[n] for n in chosen) > 700:
+        return chosen
+    if any(not tests[n]["file"].startswith("tests/dialects/") for n in chosen):
+        return chosen
+    sources = {}
+    for path, hunks in delta.items():
+        if not path.startswith("sqlglot/") or path not in coverage.sources:
+            return chosen
+        try:
+            source, _ = rewrite(coverage.sources[path], hunks)
+        except ValueError:
+            return chosen
+        module = path[:-3].removesuffix("/__init__").replace("/", ".")
+        sources[module] = source
+    request = {"sources": sources, "tests": [(n, tests[n]["id"]) for n in chosen]}
+    try:
+        run = subprocess.run([sys.executable, "-B", str(HERE / "replay.py")], input=json.dumps(request),
+                             text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4)
+        if run.returncode == 0:
+            failures = json.loads(run.stdout)
+            if isinstance(failures, list) and set(failures) <= set(chosen):
+                return failures
+    except (subprocess.TimeoutExpired, ValueError, TypeError):
+        pass
+    return chosen
+
+
 def main():
     directory = Path(os.environ.get("DATA_DIR", "/data"))
     tests = json.loads((directory / "tests.json").read_bytes())["tests"]
     durations = {t["number"]: round(1000 * t["seconds"]) for t in tests}
     by_name = {t["id"]: t["number"] for t in tests}
+    tests_by_number = {t["number"]: t for t in tests}
     coverage = Coverage()
     mapping = [by_name.get(name) for name in coverage.ids]
     unknown = set(by_name.values()) - set(mapping)
@@ -190,6 +277,7 @@ def main():
             mask |= coverage.select(path, hunks)
         chosen = [n for i, n in enumerate(mapping) if n is not None and mask & (1 << i)]
         chosen.extend(sorted(unknown))
+        chosen = replay_small_selection(delta, coverage, chosen, tests_by_number, durations)
         print(json.dumps({"commit": patch.stem, "workers": schedule(chosen, durations)}, separators=(",", ":")))
 
 
