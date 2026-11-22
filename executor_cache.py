@@ -39,10 +39,15 @@ def optimizer_input(args, kwargs):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+@functools.cache
+def read_snapshot(path):
+    with Path(path).open("rb") as source:
+        return pickle.loads(zlib.decompress(source.read()))
+
+
 class ExecutorCache:
     def __init__(self, path, changed, edited_functions=None):
-        with Path(path).open("rb") as source:
-            data = pickle.loads(zlib.decompress(source.read()))
+        data = read_snapshot(path)
         self.entries = {}
         self.optimized = {}
         self.expected = {}
@@ -128,8 +133,7 @@ def restore_fixture_tables(path):
     # Keep the upstream filename and DuckDB view. The rest of setup reads the
     # same CSV into a Python Table, which can be restored from disk.
     setup.body[2:] = ast.parse("tables[table] = _rwx_tables[directory][table]").body
-    with Path(path).open("rb") as source:
-        tpch, tpcds = pickle.loads(zlib.decompress(source.read()))
+    tpch, tpcds = read_snapshot(path)
     namespace = dict(original.__globals__, _rwx_tables={test_executor.DIR_TPCH: tpch, test_executor.DIR_TPCDS: tpcds})
     exec(compile(ast.fix_missing_locations(tree), test_executor.__file__, "exec"), namespace)
     cls.setUpClass = classmethod(namespace[method.name])

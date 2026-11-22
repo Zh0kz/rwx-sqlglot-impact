@@ -99,6 +99,8 @@ def serve(pipe):
         state = prepare()
     except Exception:
         state = None
+    snapshots_ready = False
+    snapshot_imports = set()
     while True:
         try:
             item = pipe.recv()
@@ -107,10 +109,25 @@ def serve(pipe):
         if item is None:
             return
         request, seconds = item
-        if state is None or any(module in sys.modules and module not in request["warm"]
+        if state is None or any(module in snapshot_imports or module in sys.modules and module not in request["warm"]
                                 for module in request["sources"]):
             passed = None
         else:
+            if request.get("executor_cache") and not snapshots_ready:
+                snapshots_ready = True
+                loaded = set(sys.modules)
+                try:
+                    from executor_cache import read_snapshot, table_contents
+                    read_snapshot("/app/executor.z")
+                    for tables in read_snapshot("/app/executor_tables.z"):
+                        for table in tables.values():
+                            table_contents(table)
+                except (OSError, ValueError, TypeError):
+                    pass
+                snapshot_imports = set(sys.modules) - loaded
+                if snapshot_imports.intersection(request["sources"]):
+                    pipe.send(None)
+                    continue
             passed = check_group(request, seconds, state)
         pipe.send(passed)
 

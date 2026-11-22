@@ -146,6 +146,64 @@ def enum_mask(module, edits, profile):
     return affected if edits else None
 
 
+def parser_match_mask(module, edits, profile, tokens):
+    seen = {}
+    matcher_names = {"_match", "_match_pair", "_match_set", "_match_texts"}
+    for chain in edits:
+        pair = next(((a, b) for a, b in reversed(chain) if isinstance(a, ast.Call) and isinstance(b, ast.Call)
+                     and isinstance(a.func, ast.Attribute) and a.func.attr in matcher_names), None)
+        if pair is None:
+            return None
+        old, new = pair
+        if ast.dump(old.func) != ast.dump(new.func) or len(old.args) != len(new.args):
+            return None
+        if list(map(ast.dump, old.keywords)) != list(map(ast.dump, new.keywords)):
+            return None
+        method = old.func.attr
+        leading = 2 if method == "_match_pair" else 1
+        if len(new.args) < leading or list(map(ast.dump, old.args[leading:])) != list(map(ast.dump, new.args[leading:])):
+            return None
+        def token(node):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "TokenType":
+                return tokens.get(node.attr)
+        if method in ("_match", "_match_pair"):
+            arguments = [token(arg) for arg in new.args[:leading]]
+            if not all(arguments):
+                return None
+        else:
+            collection = new.args[0]
+            if not isinstance(collection, (ast.List, ast.Tuple, ast.Set)):
+                return None
+            if method == "_match_set":
+                arguments = [token(arg) for arg in collection.elts]
+                if not all(arguments):
+                    return None
+            else:
+                arguments = [arg.value for arg in collection.elts
+                             if isinstance(arg, ast.Constant) and type(arg.value) is str]
+                if len(arguments) != len(collection.elts):
+                    return None
+        site = f"{module}:{old.lineno}:{old.col_offset}"
+        if site not in profile["sites"]:
+            return None
+        seen[site] = method, arguments
+    mask = 0
+    masks = profile["masks"]
+    for site, (method, arguments) in seen.items():
+        uncertain, rows = profile["sites"][site]
+        mask |= masks[uncertain]
+        for values, result, index in rows:
+            if method in ("_match", "_match_pair"):
+                outcome = values == arguments
+            elif method == "_match_set":
+                outcome = values[0] in arguments
+            else:
+                outcome = values[0] and values[1] in arguments
+            if result != outcome:
+                mask |= masks[index]
+    return mask if seen else None
+
+
 def bool_mask(module, edits, profile):
     matches = {}
     for chain in edits:
@@ -393,8 +451,14 @@ def dispatch_sites(module, edits):
     return locations or None
 
 
-def default_sites(path, edits):
-    sites = set()
+def defaults(args):
+    positional = args.posonlyargs + args.args
+    return zip(positional[len(positional) - len(args.defaults):] + args.kwonlyargs,
+               args.defaults + args.kw_defaults)
+
+
+def default_changes(edits):
+    found = []
     for chain in edits:
         definition = next(((i, a) for i, (a, b) in enumerate(chain[:-2])
                            if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -403,13 +467,37 @@ def default_sites(path, edits):
             return None
         i, fn = definition
         old, new = chain[i + 2]
-        if not any(old is d for d in [*fn.args.defaults, *fn.args.kw_defaults] if d is not None):
+        parameter = next((arg.arg for arg, default in defaults(fn.args) if old is default), None)
+        if parameter is None:
             return None
         try:
             literal(old)
             literal(new)
         except (ValueError, TypeError, SyntaxError):
             return None
+        found.append((fn, parameter))
+    return found
+
+
+def default_mask(module, edits, profile):
+    changes = default_changes(edits)
+    if not changes:
+        return None
+    mask = 0
+    for fn, parameter in changes:
+        site = f"{module}:{fn.lineno}:{parameter}"
+        if site not in profile:
+            return None
+        mask |= int(profile[site], 16)
+    return mask
+
+
+def default_sites(path, edits):
+    changes = default_changes(edits)
+    if not changes:
+        return None
+    sites = set()
+    for fn, _ in changes:
         first = min([fn.lineno, *(d.lineno for d in fn.decorator_list)])
         sites.add(f"{path}:{first}")
     return sites or None

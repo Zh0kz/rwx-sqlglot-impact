@@ -12,6 +12,7 @@ from equivalence import same_comparison_behavior
 import behavior
 import bindings
 import fixtures
+import decisions
 
 HERE = Path(__file__).resolve().parent
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
@@ -109,6 +110,9 @@ class Coverage:
         self.lookups = load_profile("lookups")
         self.enums = load_profile("enums")
         self.imports = load_profile("imports")
+        self.defaults = load_profile("defaults")
+        self.decisions = load_profile("decisions")
+        self.lookahead = load_profile("match")
         self.type_profiles = json.loads((HERE / "types.json").read_bytes())
         dictionary_file = HERE / "dicts.z"
         self.dict_keys = (json.loads(zlib.decompress(dictionary_file.read_bytes()))
@@ -122,8 +126,14 @@ class Coverage:
     def token_names(self):
         tree = self.syntax("sqlglot/tokenizer_core.py")
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "TokenType")
-        return {name.id for stmt in cls.body if isinstance(stmt, ast.Assign)
-                for name in stmt.targets if isinstance(name, ast.Name)}
+        names = {}
+        for stmt in cls.body:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        alias = stmt.value.id if isinstance(stmt.value, ast.Name) else None
+                        names[target.id] = names.get(alias, target.id)
+        return names
 
     @functools.cached_property
     def instructions(self):
@@ -192,6 +202,23 @@ class Coverage:
                 return reduced
         if self.enums:
             reduced = behavior.enum_mask(module, edits_ast, self.enums)
+            if reduced is not None:
+                return reduced
+        if self.defaults:
+            reduced = behavior.default_mask(module, edits_ast, self.defaults)
+            if reduced is not None:
+                return reduced
+        if self.decisions and module in self.warm_functions:
+            baseline = self.lines.get(path, {})
+            reduced = decisions.mask(module, edits_ast, self.decisions, baseline)
+            if reduced is not None:
+                keep = set(self.decisions.get("questionable", ()))
+                precaution = sum(1 << i for i, name in enumerate(self.ids) if name in keep)
+                for line in affected:
+                    reduced |= baseline.get(line, 0) & precaution
+                return reduced
+        if self.lookahead:
+            reduced = behavior.parser_match_mask(module, edits_ast, self.lookahead, self.token_names)
             if reduced is not None:
                 return reduced
         if self.order:
@@ -399,7 +426,7 @@ def main():
             mask |= coverage.select(path, hunks, single=len(delta) == 1)
         chosen = [n for i, n in enumerate(mapping) if n is not None and mask & (1 << i)]
         chosen.extend(sorted(unknown))
-        if case_index is not None and os.environ.get("RUNTIME_REPLAY", "1") == "1":
+        if case_index is not None and os.environ.get("RUNTIME_REPLAY", "1") in {"1", "heavy"}:
             chosen = refine(delta, coverage, chosen, tests_by_number, durations, case_index, rewrite, deadline, schedule)
         workers = use_available_capacity(schedule(chosen, durations), chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
