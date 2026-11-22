@@ -105,6 +105,7 @@ class Coverage:
         self.arguments = load_profile("args")
         self.tokenizer = load_profile("tokens")
         self.order = load_profile("order")
+        self.registries = load_profile("registry")
         self.type_profiles = json.loads((HERE / "types.json").read_bytes())
         dictionary_file = HERE / "dicts.z"
         self.dict_keys = (json.loads(zlib.decompress(dictionary_file.read_bytes()))
@@ -127,6 +128,9 @@ class Coverage:
 
     @functools.cached_property
     def binding_index(self):
+        packed = HERE / "references.z"
+        if packed.exists():
+            return bindings.References.unpack(packed.read_bytes())
         return bindings.References(self.sources)
 
     def select(self, path, hunks, single=True):
@@ -178,6 +182,10 @@ class Coverage:
                 return reduced
         if self.tokenizer:
             reduced = behavior.tokenizer_mask(module, edits_ast, self.tokenizer, self.token_names)
+            if reduced is not None:
+                return reduced
+        if self.registries:
+            reduced = behavior.registry_mask(module, edits_ast, self.registries)
             if reduced is not None:
                 return reduced
         if self.case_index:
@@ -347,7 +355,7 @@ def main():
     tests_by_number = {t["number"]: t for t in tests}
     coverage = Coverage()
     case_index = None
-    deadline = time.monotonic() + 40
+    deadline = time.monotonic() + 25
     if sys.platform == "linux" and (HERE / "cases.z").is_file() and Path("/src/tests").is_dir():
         from cases import CaseIndex
         from probe import refine
@@ -366,7 +374,7 @@ def main():
         chosen = [n for i, n in enumerate(mapping) if n is not None and mask & (1 << i)]
         chosen.extend(sorted(unknown))
         if case_index is not None and os.environ.get("RUNTIME_REPLAY", "1") == "1":
-            chosen = refine(delta, coverage, chosen, tests_by_number, durations, case_index, rewrite, deadline)
+            chosen = refine(delta, coverage, chosen, tests_by_number, durations, case_index, rewrite, deadline, schedule)
         workers = use_available_capacity(schedule(chosen, durations), chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if case_index is not None:

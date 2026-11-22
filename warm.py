@@ -24,6 +24,9 @@ def prepare():
     import case_hooks
     import replay
     from cold_map import InlinePool
+    import duckdb
+    import numpy
+    import pandas
     seen = set()
     mon = sys.monitoring
     def entered(code, offset):
@@ -37,6 +40,7 @@ def prepare():
     os.chdir("/src")
     concurrent.futures.ProcessPoolExecutor = InlinePool
     case_hooks.install(lambda _: None, lambda _: None, replay.keep_case)
+    from tests import test_executor, test_generator, test_optimizer
     mon.set_events(3, 0)
     mon.free_tool_id(3)
     functions = defaultdict(list)

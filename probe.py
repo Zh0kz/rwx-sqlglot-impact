@@ -45,7 +45,7 @@ def check_group(request, seconds, warm_state=None):
     return {int(line) for line in data.splitlines() if line.isdigit()}
 
 
-def refine(delta, coverage, chosen, catalog, durations, case_index, rewrite, deadline):
+def refine(delta, coverage, chosen, catalog, durations, case_index, rewrite, deadline, scheduler):
     if not chosen or time.monotonic() + 1 >= deadline:
         return chosen
     delta = {p: h for p, h in delta.items() if p not in coverage.identical}
@@ -68,22 +68,49 @@ def refine(delta, coverage, chosen, catalog, durations, case_index, rewrite, dea
         except (ValueError, OSError):
             return chosen
     scope_mask = case_index.affected(delta, coverage, rewrite)
+    use_cache = (Path("/app/executor.z").is_file() and bool(sources) and not fixtures
+                 and all(module in coverage.warm_functions
+                         and (module.startswith(("sqlglot.optimizer.", "sqlglot.parsers."))
+                              or module == "sqlglot.parser") for module in sources))
+    edited_functions = set()
+    if use_cache:
+        for path in delta:
+            module = path[:-3].removesuffix("/__init__").replace("/", ".")
+            affected = {line for ancestry in coverage.warm_functions[module] for line in ancestry}
+            for fn in case_index.functions(coverage, path):
+                if fn.lineno in affected:
+                    first = min([fn.lineno, *(d.lineno for d in fn.decorator_list)])
+                    edited_functions.add((path, first))
     options = []
     for n in chosen:
         name = catalog[n]["id"]
         skips, estimate = case_index.estimate(name, scope_mask, durations[n])
+        if use_cache and name.endswith(("::test_execute_tpcds", "::test_execute_tpch")):
+            estimate *= 0.28
         options.append((n, name, skips, estimate))
     total = sum(row[3] for row in options)
     if total > 1500:
         # Prefer short replays that can remove a dominant test from the schedule.
-        options = [r for r in options if r[3] < 1400 and durations[r[0]] > max(1250, 3 * r[3])]
+        options = [r for r in options if (r[3] < 1400 and durations[r[0]] > max(1250, 3 * r[3]))
+                   or (use_cache and r[1].endswith("::test_execute_tpcds"))]
     if not options:
         return chosen
     if len(options) < len(chosen) and max(durations[r[0]] for r in options) < 1800:
         return chosen
+    def cost(tests):
+        workers = scheduler(tests, durations)
+        return 2000 * len(workers) + max((sum(durations[n] for n in g) for g in workers), default=0)
+
+    attempted = {row[0] for row in options}
+    improvement = cost(chosen) - cost([n for n in chosen if n not in attempted])
+    predicted = sum(row[3] for row in options)
+    if improvement <= 350 + 1.5 * predicted:
+        return chosen
     options.sort(key=lambda r: (durations[r[0]] / max(5, r[3]), durations[r[0]]), reverse=True)
-    request = {"sources": sources, "fixtures": fixtures, "tests": [r[:3] for r in options]}
-    seconds = min(3.0, deadline - time.monotonic())
+    request = {"sources": sources, "fixtures": fixtures, "tests": [r[:3] for r in options],
+               "paths": list(delta), "executor_cache": use_cache, "edited_functions": edited_functions}
+    long_replay = use_cache and any(r[1].endswith("::test_execute_tpcds") for r in options)
+    seconds = min(7.0 if long_replay else 2.2, deadline - time.monotonic(), improvement / 1250)
     request["warm"] = coverage.warm_functions
     passed = warm.check(request, seconds)
     if passed is None:

@@ -68,7 +68,15 @@ def run(data, report, warm_state=None):
         if warm_state is None:
             case_hooks.install(lambda _: None, lambda _: None, keep_case)
         if any(node.startswith("tests/test_executor.py::") for _, node, _ in data["tests"]):
-            case_hooks.install_executor(lambda _: None, lambda _: None, keep_case)
+            select_case = lambda key: None
+            if data.get("executor_cache"):
+                from executor_cache import ExecutorCache, restore_fixture_tables
+                cache = ExecutorCache("/app/executor.z", set(data["paths"]), data.get("edited_functions"))
+                cache.install()
+                if os.path.isfile("/app/executor_tables.z"):
+                    restore_fixture_tables("/app/executor_tables.z")
+                select_case = cache.begin
+            case_hooks.install_executor(lambda _: None, lambda _: None, keep_case, select_case)
         if any(node.endswith("::test_generator_memory") for _, node, _ in data["tests"]):
             case_hooks.install_memory(lambda _: None, lambda _: None, keep_case)
         for number, node, skip_cases in data["tests"]:

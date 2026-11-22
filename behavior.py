@@ -211,8 +211,8 @@ def instruction_mask(path, edits, profiles, line_masks):
     return affected if edits else None
 
 
-def tokenizer_mask(module, edits, profile, token_names):
-    affected = 0
+def dictionary_changes(module, edits):
+    result = []
     inspected = set()
     for chain in edits:
         location = next((i for i, (a, b) in enumerate(chain[:-1])
@@ -237,28 +237,60 @@ def tokenizer_mask(module, edits, profile, token_names):
             return None
         qualified = ".".join([*(a.name for a, _ in chain[:location] if isinstance(a, ast.ClassDef)),
                               targets[0].id])
-        rows = profile.get(f"{module}:{qualified}")
-        if rows is None or len(old.keys) != len(new.keys):
+        if len(old.keys) != len(new.keys):
             return None
         for k, k2, v, v2 in zip(old.keys, new.keys, old.values, new.values):
             if (k is None) != (k2 is None) or k is not None and ast.dump(k) != ast.dump(k2):
                 return None
             if ast.dump(v) == ast.dump(v2):
                 continue
-            if not isinstance(k, ast.Constant) or type(k.value) is not str:
+            result.append((f"{module}:{qualified}", k, v, v2))
+    return result
+
+
+def tokenizer_mask(module, edits, profile, token_names):
+    affected = 0
+    changes = dictionary_changes(module, edits)
+    if not changes:
+        return None
+    for name, k, v, v2 in changes:
+        if name.endswith(".UNESCAPED_SEQUENCES") or name not in profile:
+            return None
+        if not isinstance(k, ast.Constant) or type(k.value) is not str:
+            return None
+        try:
+            if isinstance(v, ast.Attribute) and isinstance(v2, ast.Attribute):
+                if not (isinstance(v.value, ast.Name) and isinstance(v2.value, ast.Name)
+                        and v.value.id == v2.value.id == "TokenType" and v2.attr in token_names):
+                    return None
+            elif type(literal(v)) is not type(literal(v2)):
                 return None
-            try:
-                if isinstance(v, ast.Attribute) and isinstance(v2, ast.Attribute):
-                    if not (isinstance(v.value, ast.Name) and isinstance(v2.value, ast.Name)
-                            and v.value.id == v2.value.id == "TokenType" and v2.attr in token_names):
-                        return None
-                else:
-                    if type(literal(v)) is not type(literal(v2)):
-                        return None
-            except (ValueError, TypeError, SyntaxError):
-                return None
-            affected |= int(rows.get(k.value, "0"), 16)
-    return affected if edits else None
+        except (ValueError, TypeError, SyntaxError):
+            return None
+        affected |= int(profile[name].get(k.value, "0"), 16)
+    return affected
+
+
+def registry_mask(module, edits, profile):
+    changes = dictionary_changes(module, edits)
+    if not changes:
+        return None
+    mask = 0
+    for name, key, old, new in changes:
+        if name not in profile or not name.endswith(".TYPE_MAPPING"):
+            return None
+        if not (isinstance(old, ast.Constant) and type(old.value) is str
+                and isinstance(new, ast.Constant) and type(new.value) is str):
+            return None
+        if isinstance(key, ast.Constant) and type(key.value) is str:
+            lookup = "str:" + key.value
+        elif isinstance(key, ast.Attribute) and getattr(key.value, "attr", None) == "DType":
+            lookup = "dtype:" + key.attr
+        else:
+            return None
+        rows = profile[name]
+        mask |= int(rows.get(lookup, "0"), 16) | int(rows.get("*", "0"), 16)
+    return mask
 
 
 def dispatch_sites(module, edits):

@@ -1,6 +1,9 @@
 """Compare the original fixture readers' inputs after a SQL fixture edit."""
 import functools
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -42,6 +45,29 @@ def original(path):
     return (Path(os.environ.get("SQLGLOT_ROOT", "/src")) / path).read_text(encoding="utf-8")
 
 
+def executor_inputs_changed(old, new):
+    baseline = {sql for _, sql, _ in old}
+    executed = {sql for metadata, sql, _ in old if metadata.get("execute")}
+    if any(m.get("execute") and sql not in executed for m, sql, _ in new):
+        return True
+    untested = {sql for m, sql, _ in new if not m.get("execute") and sql not in baseline}
+    if not untested:
+        return False
+    if len(untested) > 8 or sum(map(len, untested)) > 60000:
+        return True
+    try:
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import json,sys; from sqlglot import parse_one; "
+             "[parse_one(sql) for sql in json.load(sys.stdin)]"],
+            cwd=os.environ.get("SQLGLOT_ROOT", "/src"), input=json.dumps(sorted(untested)), text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode != 0
+
+
 def select(path, hunks, coverage, rewrite):
     if not path.startswith("tests/fixtures/optimizer/") or not path.endswith(".sql"):
         return None
@@ -62,9 +88,7 @@ def select(path, hunks, coverage, rewrite):
         return 0
     optimizer, execute, optimized = TPC[path]
     selected = {optimizer}
-    if [(m.get("execute"), sql) for m, sql, _ in old_pairs] != [
-        (m.get("execute"), sql) for m, sql, _ in new_pairs
-    ]:
+    if executor_inputs_changed(old_pairs, new_pairs):
         selected.add(execute)
     if optimized and [(sql, exp) for _, sql, exp in old_pairs] != [
         (sql, exp) for _, sql, exp in new_pairs

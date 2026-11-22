@@ -59,7 +59,7 @@ def install(enter, leave, keep):
         setattr(helpers, name, make_generator(original))
 
 
-def install_executor(enter, leave, keep):
+def install_executor(enter, leave, keep, select=lambda key: None):
     from tests import test_executor as executor
     # The original method dispatches independent queries to workers and then
     # checks the results in submission order. Preserve the pickle boundary and
@@ -70,6 +70,7 @@ def install_executor(enter, leave, keep):
             key = label(("executor", tpch, i, sql))
             if keep(key):
                 token = enter(key)
+                select(key if meta.get("execute") else None)
                 try:
                     expression = pickle.loads(pickle.dumps(executor.parse_one(sql)))
                     table = executor.mp_execute(expression, meta)

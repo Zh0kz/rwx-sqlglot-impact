@@ -1,7 +1,9 @@
 """Index when an immutable module setting is read by the reference suite."""
 import ast
 import dis
+import json
 import types
+import zlib
 from collections import defaultdict
 
 
@@ -59,6 +61,21 @@ class References:
                         self.imports[owner, name.name].add((path, name.asname or name.name))
             self.walk(path, compile(tree, path, "exec"))
 
+    def packed(self):
+        by_global = {p: {n: sorted(lines) for n, lines in rows.items()} for p, rows in self.global_reads.items()}
+        by_attr = {n: {p: sorted(lines) for p, lines in rows.items()} for n, rows in self.attr_reads.items()}
+        imports = [[origin, name, sorted(rows)] for (origin, name), rows in self.imports.items()]
+        return zlib.compress(json.dumps([by_global, by_attr, imports], separators=(",", ":")).encode(), 9)
+
+    @classmethod
+    def unpack(cls, data):
+        glob, attrs, imports = json.loads(zlib.decompress(data))
+        obj = cls.__new__(cls)
+        obj.global_reads = glob
+        obj.attr_reads = attrs
+        obj.imports = {(origin, name): rows for origin, name, rows in imports}
+        return obj
+
     def walk(self, path, code):
         function = bool(code.co_flags & 1)
         for instruction in dis.get_instructions(code):
@@ -85,11 +102,11 @@ class References:
                 continue
             seen.add((file, name))
             origin = module_name(file)
-            if self.imports[origin, "*"]:
+            if self.imports.get((origin, "*")):
                 return None
-            work.extend(self.imports[origin, name])
-            readers = {path: set(lines) for path, lines in self.attr_reads[name].items()}
-            readers.setdefault(file, set()).update(self.global_reads[file].get(name, ()))
+            work.extend(self.imports.get((origin, name), ()))
+            readers = {path: set(lines) for path, lines in self.attr_reads.get(name, {}).items()}
+            readers.setdefault(file, set()).update(self.global_reads.get(file, {}).get(name, ()))
             for path, lines in readers.items():
                 if 0 in lines:
                     return None
