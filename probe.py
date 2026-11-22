@@ -74,16 +74,16 @@ def refine(delta, coverage, chosen, catalog, durations, case_index, rewrite, dea
         skips, estimate = case_index.estimate(name, scope_mask, durations[n])
         options.append((n, name, skips, estimate))
     total = sum(row[3] for row in options)
-    if total > 1700:
-        # Partial replay pays when a single test dominates the schedule and
-        # most of its baseline cases can be skipped. For other broad changes,
-        # retain the static selection.
-        options = [r for r in options if r[3] < 1100 and durations[r[0]] > max(750, 4 * r[3])]
+    if total > 1500:
+        # Prefer short replays that can remove a dominant test from the schedule.
+        options = [r for r in options if r[3] < 1400 and durations[r[0]] > max(1250, 3 * r[3])]
     if not options:
+        return chosen
+    if len(options) < len(chosen) and max(durations[r[0]] for r in options) < 1800:
         return chosen
     options.sort(key=lambda r: (durations[r[0]] / max(5, r[3]), durations[r[0]]), reverse=True)
     request = {"sources": sources, "fixtures": fixtures, "tests": [r[:3] for r in options]}
-    seconds = min(2.5, deadline - time.monotonic())
+    seconds = min(3.0, deadline - time.monotonic())
     request["warm"] = coverage.warm_functions
     passed = warm.check(request, seconds)
     if passed is None:

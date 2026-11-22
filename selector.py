@@ -292,7 +292,7 @@ def main():
     tests_by_number = {t["number"]: t for t in tests}
     coverage = Coverage()
     case_index = None
-    deadline = time.monotonic() + 85
+    deadline = time.monotonic() + 40
     if sys.platform == "linux" and (HERE / "cases.z").is_file() and Path("/src/tests").is_dir():
         from cases import CaseIndex
         from probe import refine
