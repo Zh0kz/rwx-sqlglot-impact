@@ -10,6 +10,8 @@ import zlib
 from pathlib import Path
 from equivalence import same_comparison_behavior
 import behavior
+import bindings
+import fixtures
 
 HERE = Path(__file__).resolve().parent
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
@@ -102,6 +104,7 @@ class Coverage:
         self.booleans = load_profile("bools")
         self.arguments = load_profile("args")
         self.tokenizer = load_profile("tokens")
+        self.order = load_profile("order")
         self.type_profiles = json.loads((HERE / "types.json").read_bytes())
         dictionary_file = HERE / "dicts.z"
         self.dict_keys = (json.loads(zlib.decompress(dictionary_file.read_bytes()))
@@ -122,8 +125,16 @@ class Coverage:
     def instructions(self):
         return load_profile("instructions")
 
-    def select(self, path, hunks):
+    @functools.cached_property
+    def binding_index(self):
+        return bindings.References(self.sources)
+
+    def select(self, path, hunks, single=True):
         if not path.endswith(".py"):
+            if single:
+                reduced = fixtures.select(path, hunks, self, rewrite)
+                if reduced is not None:
+                    return reduced
             return self.files.get(path, self.full if path.startswith("tests/fixtures/") else 0)
         if path not in self.sources or not hunks:
             return self.full
@@ -153,6 +164,10 @@ class Coverage:
             reduced = behavior.compare_mask(module, edits_ast, self.values)
             if reduced is not None:
                 return reduced
+        if self.order:
+            reduced = behavior.order_mask(module, edits_ast, self.order)
+            if reduced is not None:
+                return reduced
         if self.booleans:
             reduced = behavior.bool_mask(module, edits_ast, self.booleans)
             if reduced is not None:
@@ -166,7 +181,7 @@ class Coverage:
             if reduced is not None:
                 return reduced
         if self.case_index:
-            sites = behavior.dispatch_sites(module, edits_ast)
+            sites = behavior.dispatch_sites(module, edits_ast) or behavior.default_sites(path, edits_ast)
             mask = self.case_index.tests_for(sites, self.ids)
             if mask is not None:
                 self.scope_keys[path] = sites
@@ -183,6 +198,10 @@ class Coverage:
         dictionary = self.dictionary_update(path, old, new, affected)
         if dictionary is not None:
             return dictionary
+        if path.startswith("sqlglot/") and (names := bindings.changed_setting(old, new, edits_ast)):
+            reduced = self.binding_index.select(path, names, self)
+            if reduced is not None:
+                return reduced
         rows = self.lines.get(path, {})
         if self.instructions:
             reduced = behavior.instruction_mask(path, edits_ast, self.instructions, rows)
@@ -304,6 +323,22 @@ def schedule(numbers, durations):
     return best
 
 
+def use_available_capacity(workers, chosen, durations):
+    if len(workers) < 2:
+        return workers
+    loads = [sum(durations[n] for n in group) for group in workers]
+    limit = max(loads)
+    remaining = list(zip(loads, range(len(workers))))
+    for number in sorted(durations.keys() - set(chosen), key=lambda n: (durations[n], n)):
+        load, index = min(remaining)
+        new_load = load + durations[number]
+        if new_load > limit:
+            break
+        remaining[index] = (new_load, index)
+        workers[index].append(number)
+    return workers
+
+
 def main():
     directory = Path(os.environ.get("DATA_DIR", "/data"))
     tests = json.loads((directory / "tests.json").read_bytes())["tests"]
@@ -327,12 +362,13 @@ def main():
         delta = changes(patch.read_text("utf-8"))
         mask = 0 if delta else coverage.full
         for path, hunks in delta.items():
-            mask |= coverage.select(path, hunks)
+            mask |= coverage.select(path, hunks, single=len(delta) == 1)
         chosen = [n for i, n in enumerate(mapping) if n is not None and mask & (1 << i)]
         chosen.extend(sorted(unknown))
         if case_index is not None and os.environ.get("RUNTIME_REPLAY", "1") == "1":
             chosen = refine(delta, coverage, chosen, tests_by_number, durations, case_index, rewrite, deadline)
-        print(json.dumps({"commit": patch.stem, "workers": schedule(chosen, durations)}, separators=(",", ":")))
+        workers = use_available_capacity(schedule(chosen, durations), chosen, durations)
+        print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if case_index is not None:
         import warm
         warm.close()

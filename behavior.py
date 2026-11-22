@@ -122,6 +122,27 @@ def bool_mask(module, edits, profile):
     return affected
 
 
+def order_mask(module, edits, profile):
+    result = 0
+    for chain in edits:
+        pair = next(((a, b) for a, b in reversed(chain) if isinstance(a, ast.Compare)
+                     and isinstance(b, ast.Compare)), None)
+        if not pair:
+            return None
+        a, b = pair
+        if len(a.ops) != 1 or len(b.ops) != 1:
+            return None
+        if {type(a.ops[0]), type(b.ops[0])} not in ({ast.Lt, ast.LtE}, {ast.Gt, ast.GtE}):
+            return None
+        if ast.dump(a.left) != ast.dump(b.left) or ast.dump(a.comparators[0]) != ast.dump(b.comparators[0]):
+            return None
+        site = f"{module}:{a.lineno}:{a.col_offset}"
+        if site not in profile:
+            return None
+        result |= int(profile[site], 16)
+    return result if edits else None
+
+
 def argument_mask(module, edits, profile):
     affected = 0
     for chain in edits:
@@ -269,3 +290,25 @@ def dispatch_sites(module, edits):
             return None
         locations.add(match)
     return locations or None
+
+
+def default_sites(path, edits):
+    sites = set()
+    for chain in edits:
+        definition = next(((i, a) for i, (a, b) in enumerate(chain[:-2])
+                           if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef))
+                           and isinstance(b, type(a)) and chain[i + 1] == (a.args, b.args)), None)
+        if not definition:
+            return None
+        i, fn = definition
+        old, new = chain[i + 2]
+        if not any(old is d for d in [*fn.args.defaults, *fn.args.kw_defaults] if d is not None):
+            return None
+        try:
+            literal(old)
+            literal(new)
+        except (ValueError, TypeError, SyntaxError):
+            return None
+        first = min([fn.lineno, *(d.lineno for d in fn.decorator_list)])
+        sites.add(f"{path}:{first}")
+    return sites or None
