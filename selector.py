@@ -115,6 +115,12 @@ class Coverage:
         for number in affected:
             enclosing = [n for n in functions if n.lineno < number <= n.end_lineno]
             if enclosing:
+                function = min(enclosing, key=lambda n: n.end_lineno - n.lineno)
+                # A mutation can enter a path not taken on the original run.
+                # Include callers of the containing function, even where an
+                # individual line had no event (e.g. a skipped operand).
+                for line in range(function.lineno, function.end_lineno + 1):
+                    selected |= rows.get(line, 0)
                 if number not in rows or source_lines[number - 1].lstrip().startswith(("and ", "or ")):
                     # Continuation lines may share a line event with the start of the statement.
                     spans = [n for n in ast.walk(min(enclosing, key=lambda n: n.end_lineno - n.lineno))
@@ -141,7 +147,6 @@ class Coverage:
                     key = path[:-3].replace("/", ".") + ":" + parents + "." + target.id
                     if key in self.attributes:
                         selected |= self.attributes[key]
-                        continue
                 if path.startswith("sqlglot/expressions/") and enclosing_classes and self.classes:
                     name = scope.name
                     selected |= self.classes.get(name, self.full)
